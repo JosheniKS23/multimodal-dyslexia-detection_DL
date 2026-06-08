@@ -68,9 +68,6 @@ class CharacterDataset(Dataset):
             cls, x, y, bw, bh = map(float, line.split())
             cls = int(cls)
 
-            if cls == 2:
-                continue
-
             x1 = int((x - bw/2) * w)
             y1 = int((y - bh/2) * h)
             x2 = int((x + bw/2) * w)
@@ -118,7 +115,7 @@ val_loader = DataLoader(
 )
 
 # ==============================
-# MODEL
+# MODEL (3 CLASS + FEATURE EXTRACTOR)
 # ==============================
 class SimpleCNN(nn.Module):
     def __init__(self):
@@ -134,23 +131,39 @@ class SimpleCNN(nn.Module):
             nn.MaxPool2d(2),
         )
 
-        self.fc = nn.Sequential(
-            nn.Linear(32 * 8 * 8, 64),
-            nn.ReLU(),
-            nn.Linear(64, 2)
+        # feature layer
+        self.feature_fc = nn.Sequential(
+            nn.Linear(32 * 8 * 8, 128),
+            nn.ReLU()
         )
 
-    def forward(self, x):
+        # classifier
+        self.classifier = nn.Linear(128, 3)
+
+    def forward(self, x, return_features=False):
         x = self.conv(x)
         x = x.view(x.size(0), -1)
-        return self.fc(x)
+
+        features = self.feature_fc(x)
+
+        if return_features:
+            return features
+
+        out = self.classifier(features)
+        return out
+
 
 model = SimpleCNN().to(device)
 
 # ==============================
-# LOSS (CLASS WEIGHT FIX)
+# LOSS (3 CLASS)
 # ==============================
-class_weights = torch.tensor([1.0, 2.5]).to(device)
+class_weights = torch.tensor([
+    1.0,  # normal
+    2.5,  # reversal
+    2.0   # corrected
+]).to(device)
+
 criterion = nn.CrossEntropyLoss(weight=class_weights)
 
 optimizer = optim.Adam(model.parameters(), lr=0.001)
@@ -158,16 +171,19 @@ optimizer = optim.Adam(model.parameters(), lr=0.001)
 # ==============================
 # TRAINING
 # ==============================
-epochs = 5
+epochs = 10
 
 for epoch in range(epochs):
     model.train()
     train_loss = 0
 
+    print(f"\nEpoch {epoch+1}")
+
     for images, labels in tqdm(train_loader):
         images, labels = images.to(device), labels.to(device)
 
         optimizer.zero_grad()
+
         outputs = model(images)
         loss = criterion(outputs, labels)
 
@@ -176,115 +192,359 @@ for epoch in range(epochs):
 
         train_loss += loss.item()
 
-    print(f"Epoch {epoch+1}, Loss: {train_loss:.4f}")
+    print(f"Loss: {train_loss:.4f}")
 
 # ==============================
-# VALIDATION + PROBABILITIES
+# VALIDATION + METRICS (3 CLASS)
 # ==============================
+from sklearn.metrics import (
+    classification_report,
+    roc_auc_score
+)
+from sklearn.preprocessing import label_binarize
+
 model.eval()
-all_probs, all_labels = [], []
+
+all_preds = []
+all_labels = []
+all_probs = []
 
 with torch.no_grad():
+
     for images, labels in val_loader:
+
         images = images.to(device)
 
         outputs = model(images)
-        probs = torch.softmax(outputs, dim=1)[:, 1]
 
-        all_probs.extend(probs.cpu().numpy())
-        all_labels.extend(labels.numpy())
+        probs = torch.softmax(outputs, dim=1)
+
+        preds = torch.argmax(
+            probs,
+            dim=1
+        )
+
+        all_probs.extend(
+            probs.cpu().numpy()
+        )
+
+        all_preds.extend(
+            preds.cpu().numpy()
+        )
+
+        all_labels.extend(
+            labels.numpy()
+        )
 
 all_probs = np.array(all_probs)
+all_preds = np.array(all_preds)
 all_labels = np.array(all_labels)
 
 # ==============================
-# THRESHOLD OPTIMIZATION
+# BASIC METRICS
 # ==============================
-thresholds = np.linspace(0, 1, 100)
-f1_scores = []
+acc = accuracy_score(
+    all_labels,
+    all_preds
+)
 
-best_f1 = 0
-best_thresh = 0
+precision = precision_score(
+    all_labels,
+    all_preds,
+    average='weighted',
+    zero_division=0
+)
 
-for t in thresholds:
-    preds = (all_probs >= t).astype(int)
-    f1 = f1_score(all_labels, preds)
-    f1_scores.append(f1)
+recall = recall_score(
+    all_labels,
+    all_preds,
+    average='weighted',
+    zero_division=0
+)
 
-    if f1 > best_f1:
-        best_f1 = f1
-        best_thresh = t
-
-print("Best Threshold:", best_thresh)
-print("Best F1:", best_f1)
-
-# ==============================
-# FINAL METRICS
-# ==============================
-final_preds = (all_probs >= best_thresh).astype(int)
-
-acc = accuracy_score(all_labels, final_preds)
-precision = precision_score(all_labels, final_preds)
-recall = recall_score(all_labels, final_preds)
-f1 = f1_score(all_labels, final_preds)
-cm = confusion_matrix(all_labels, final_preds)
+f1 = f1_score(
+    all_labels,
+    all_preds,
+    average='weighted',
+    zero_division=0
+)
 
 print("\nFINAL METRICS")
 print(f"Accuracy: {acc:.4f}")
 print(f"Precision: {precision:.4f}")
 print(f"Recall: {recall:.4f}")
 print(f"F1 Score: {f1:.4f}")
-print("Confusion Matrix:\n", cm)
 
 # ==============================
-# CONFUSION MATRIX PLOT
+# CLASSIFICATION REPORT
 # ==============================
-plt.imshow(cm)
-plt.title("Confusion Matrix")
+print("\nCLASSIFICATION REPORT")
+
+print(
+    classification_report(
+        all_labels,
+        all_preds,
+        target_names=[
+            "Normal",
+            "Reversal",
+            "Corrected"
+        ],
+    zero_division=0
+    )
+)
+
+# ==============================
+# CONFUSION MATRIX
+# ==============================
+cm = confusion_matrix(
+    all_labels,
+    all_preds
+)
+print("\nPer-class Accuracy")
+
+classes = [
+    "Normal",
+    "Reversal",
+    "Corrected"
+]
+
+for i, cls_name in enumerate(classes):
+
+    total_class_samples = cm[i].sum()
+
+    if total_class_samples == 0:
+        class_acc = 0
+    else:
+        class_acc = (
+            cm[i, i]
+            / total_class_samples
+        )
+
+    print(
+        f"{cls_name}: "
+        f"{class_acc:.4f}"
+    )
+
+plt.figure(figsize=(7,6))
+
+plt.imshow(cm, interpolation='nearest')
+
+plt.title(
+    "Confusion Matrix"
+)
+
 plt.colorbar()
-plt.xticks([0,1], ["Normal", "Reversal"])
-plt.yticks([0,1], ["Normal", "Reversal"])
 
-for i in range(2):
-    for j in range(2):
-        plt.text(j, i, cm[i, j], ha='center', va='center')
+classes = [
+    "Normal",
+    "Reversal",
+    "Corrected"
+]
+
+plt.xticks(
+    range(3),
+    classes
+)
+
+plt.yticks(
+    range(3),
+    classes
+)
+
+for i in range(3):
+    for j in range(3):
+        plt.text(
+            j,
+            i,
+            cm[i, j],
+            ha='center',
+            va='center'
+        )
 
 plt.xlabel("Predicted")
 plt.ylabel("Actual")
 plt.show()
 
 # ==============================
-# ROC CURVE
+# ROC CURVE (ONE VS REST)
 # ==============================
-fpr, tpr, _ = roc_curve(all_labels, all_probs)
-roc_auc = auc(fpr, tpr)
+binary_labels = label_binarize(
+    all_labels,
+    classes=[0,1,2]
+)
 
-plt.plot(fpr, tpr, label=f"AUC = {roc_auc:.4f}")
-plt.plot([0,1], [0,1], linestyle='--')
-plt.title("ROC Curve")
-plt.xlabel("FPR")
-plt.ylabel("TPR")
+plt.figure(figsize=(7,6))
+
+class_names = [
+    "Normal",
+    "Reversal",
+    "Corrected"
+]
+
+for i in range(3):
+
+    fpr, tpr, _ = roc_curve(
+        binary_labels[:, i],
+        all_probs[:, i]
+    )
+
+    roc_auc = auc(
+        fpr,
+        tpr
+    )
+
+    plt.plot(
+        fpr,
+        tpr,
+        label=f"{class_names[i]} AUC = {roc_auc:.3f}"
+    )
+
+plt.plot(
+    [0,1],
+    [0,1],
+    linestyle='--'
+)
+
+plt.xlabel(
+    "False Positive Rate"
+)
+
+plt.ylabel(
+    "True Positive Rate"
+)
+
+plt.title(
+    "Multi-Class ROC Curve"
+)
+
 plt.legend()
 plt.show()
 
 # ==============================
 # PRECISION-RECALL CURVE
 # ==============================
-precision_vals, recall_vals, _ = precision_recall_curve(all_labels, all_probs)
+plt.figure(figsize=(7,6))
 
-plt.plot(recall_vals, precision_vals)
-plt.title("Precision-Recall Curve")
+for i in range(3):
+
+    precision_vals, recall_vals, _ = precision_recall_curve(
+        binary_labels[:, i],
+        all_probs[:, i]
+    )
+
+    plt.plot(
+        recall_vals,
+        precision_vals,
+        label=class_names[i]
+    )
+
 plt.xlabel("Recall")
 plt.ylabel("Precision")
+
+plt.title(
+    "Precision-Recall Curve"
+)
+
+plt.legend()
 plt.show()
 
 # ==============================
-# F1 vs THRESHOLD (NEW)
+# MULTI-CLASS AUC
 # ==============================
-plt.plot(thresholds, f1_scores)
-plt.axvline(best_thresh, linestyle='--', label=f"Best={best_thresh:.2f}")
-plt.title("F1 Score vs Threshold")
-plt.xlabel("Threshold")
-plt.ylabel("F1 Score")
-plt.legend()
-plt.show()
+multi_auc = roc_auc_score(
+    binary_labels,
+    all_probs,
+    multi_class='ovr'
+)
+
+print(
+    f"\nMulti-class AUC: {multi_auc:.4f}"
+)
+# ==============================
+# SAVE MODEL WEIGHTS
+# ==============================
+torch.save(
+    model.state_dict(),
+    "cnn_image_branch.pth"
+)
+
+print("✅ Image model saved")
+
+# ==============================
+# FEATURE EXTRACTION
+# ==============================
+model.eval()
+
+image_features = []
+image_labels = []
+feature_loader = DataLoader(
+    CharacterDataset(
+        train_img_dir,
+        train_lbl_dir,
+        transform
+    ),
+    batch_size=8,
+    shuffle=False,
+    collate_fn=collate_fn
+)
+
+with torch.no_grad():
+    for images, labels in feature_loader:
+
+        images = images.to(device)
+
+        feats = model(
+            images,
+            return_features=True
+        )
+
+        image_features.append(
+            feats.cpu()
+        )
+
+        image_labels.append(labels)
+
+image_features = torch.cat(
+    image_features
+)
+
+image_labels = torch.cat(
+    image_labels
+)
+
+print(image_features.shape)
+print(image_labels.shape)
+
+# ==============================
+# MULTIMODAL LABEL MAPPING
+# ==============================
+# Normal = 0
+# Reversal = 1
+# Corrected = 1
+
+fusion_labels = image_labels.clone()
+
+fusion_labels[
+    fusion_labels == 2
+] = 1
+
+# ==============================
+# SAVE FEATURES + LABELS
+# ==============================
+torch.save(
+    image_features,
+    "image_branch_features.pth"
+)
+
+torch.save(
+    fusion_labels,
+    "image_labels.pth"
+)
+torch.save(
+    image_labels,
+    "image_labels_original.pth"
+)
+
+print("✅ Features saved")
+print("✅ Labels saved")
+
